@@ -215,7 +215,8 @@ inline bst_state* bst_init_from_hmodule(HMODULE hmod) {
 	s->audio = nullptr;
 	s->message_window = nullptr; // We'll create this in the speak function encase the user calls speak on another thread from init.
 	s->sonic_stream = nullptr; // We'll create this the first time a rate multiplier is applied.
-	if (!s->bstCreate || !s->TtsWav || s->bstCreate(s->tts)) {
+	if (!s->bstCreate || !s->TtsWav || !s->bstRelBuf || !s->bstDestroy ||
+		!s->bstClose || !s->bstSetParams || !s->bstGetParams || s->bstCreate(s->tts)) {
 		FreeLibrary(s->dll);
 		free(s);
 		return nullptr;
@@ -240,6 +241,10 @@ b32w_export void bst_free(bst_state* s) {
 }
 inline void bst_speak_internal(bst_state* s, const char* text, int voice, int rate, float rate_multiplier, int gain) {
 	if (!s->message_window) s->message_window = create_message_window();
+	if (!s->message_window) {
+		s->async_stop_speaking = true;
+		return;
+	}
 	if (rate_multiplier != 1.0 && !s->sonic_stream) s->sonic_stream = sonicCreateStream(11025, 1);
 	if (voice >= 0 && voice < bst_voice_count) { // prepend voice prefixes
 		int text_len = strlen(bst_voice_data[voice * 3 + 1]) + strlen(bst_voice_data[voice * 3 + 2]) + strlen(text) + 1;

@@ -45,6 +45,7 @@ static PendingCmd        g_pending = {};
 static CRITICAL_SECTION  g_pending_cs;
 // Signalled when g_pending.valid becomes true, or g_quit becomes true.
 static HANDLE            g_cmd_event;
+static const uint32_t     MAX_TEXT_LENGTH = 16 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 
@@ -100,6 +101,13 @@ static DWORD WINAPI stdin_reader(LPVOID /*unused*/)
             continue;
         }
 
+        if (text_len > MAX_TEXT_LENGTH) {
+            g_quit = true;
+            g_cancel = true;
+            SetEvent(g_cmd_event);
+            return 0;
+        }
+
         float rate_mult = 1.0f;
         if (!read_exact(stdin, &rate_mult, sizeof(float))) {
             g_quit = true;
@@ -148,8 +156,18 @@ int wmain(int argc, wchar_t** argv)
 
     InitializeCriticalSection(&g_pending_cs);
     g_cmd_event = CreateEvent(NULL, /*manualReset=*/FALSE, /*initial=*/FALSE, NULL);
-
-    CreateThread(NULL, 0, stdin_reader, NULL, 0, NULL);
+    if (!g_cmd_event) {
+        bst_free(state);
+        DeleteCriticalSection(&g_pending_cs);
+        return 2;
+    }
+    HANDLE reader_thread = CreateThread(NULL, 0, stdin_reader, NULL, 0, NULL);
+    if (!reader_thread) {
+        bst_free(state);
+        CloseHandle(g_cmd_event);
+        DeleteCriticalSection(&g_pending_cs);
+        return 3;
+    }
 
     while (true) {
         WaitForSingleObject(g_cmd_event, INFINITE);
@@ -176,6 +194,12 @@ int wmain(int argc, wchar_t** argv)
         fflush(stdout);
     }
 
+    WaitForSingleObject(reader_thread, INFINITE);
+    CloseHandle(reader_thread);
+    EnterCriticalSection(&g_pending_cs);
+    if (g_pending.valid) delete[] g_pending.text;
+    g_pending = {};
+    LeaveCriticalSection(&g_pending_cs);
     bst_free(state);
     DeleteCriticalSection(&g_pending_cs);
     CloseHandle(g_cmd_event);

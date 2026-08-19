@@ -97,10 +97,8 @@ class SynthDriver(SynthDriver):
 		driverDir = os.path.dirname(__file__)
 		return (
 			os.path.isfile(os.path.join(driverDir, "b32_tts.dll"))
-			and (
-				os.path.isfile(os.path.join(driverDir, "b32_wrapper.dll"))
-				or os.path.isfile(os.path.join(driverDir, "b32_helper.exe"))
-			)
+			and os.path.isfile(os.path.join(driverDir, "b32_wrapper.dll"))
+			and os.path.isfile(os.path.join(driverDir, "b32_helper.exe"))
 		)
 
 	def __init__(self):
@@ -199,7 +197,7 @@ class SynthDriver(SynthDriver):
 
 	def _set_headsize(self, vl):
 		n = int(vl)
-		self._headsize = vl if n > -1 and n < 7 else 1
+		self._headsize = vl if 1 <= n <= 6 else "1"
 
 	def _get_headsize(self):
 		return self._headsize
@@ -209,7 +207,7 @@ class SynthDriver(SynthDriver):
 
 	def _set_excitation(self, vl):
 		n = int(vl)
-		self._excitation = vl if n > -1 and n < 8 else 1
+		self._excitation = vl if 1 <= n <= 7 else "3"
 
 	def _get_excitation(self):
 		return self._excitation
@@ -261,12 +259,16 @@ class SynthDriver(SynthDriver):
 		return re.sub(r"\b\d{5,}\b", replace_num, text)
 
 	def speak(self, speechSequence):
-		lst = ["~n10,0]" if self._abbreviations else "~n10,1]", "~~1,0]" if self._phrasePrediction else "~~1,1]"]
-		idx = []
+		initialCommands = ["~n10,0]" if self._abbreviations else "~n10,1]", "~~1,0]" if self._phrasePrediction else "~~1,1]"]
+		lst = list(initialCommands)
+		segments = []
+		leadingIndexes = []
+		hasText = False
 		char_mode_on = pitch_modified = False
 		for item in speechSequence:
 			if isinstance(item, str):
 				lst.append(item)
+				hasText = True
 				if char_mode_on:
 					lst.append("~n1,0]")
 					char_mode_on = False
@@ -274,7 +276,14 @@ class SynthDriver(SynthDriver):
 					lst.append(f"~f{self._pitch}]")
 					pitch_modified = False
 			elif isinstance(item, IndexCommand):
-				idx.append(item.index)
+				if hasText:
+					segments.append([self._formatSpeechSegment(lst), [item.index]])
+					lst = list(initialCommands)
+					hasText = False
+				elif segments:
+					segments[-1][1].append(item.index)
+				else:
+					leadingIndexes.append(item.index)
 			elif isinstance(item,CharacterModeCommand):
 				char_mode_on = bool(item.state)
 				lst.append("~n1,1]" if char_mode_on else "~n1,0]")
@@ -284,83 +293,92 @@ class SynthDriver(SynthDriver):
 				f = int(self._pitch * multiplier)
 				lst.append(f"~f{f}]")
 				pitch_modified = True
-		text = " ".join(lst)
+		if hasText:
+			segments.append([self._formatSpeechSegment(lst), []])
+		_execWhenDone(self._speakBg, segments, leadingIndexes, mustBeAsync=True)
+
+	def _formatSpeechSegment(self, commands):
+		text = " ".join(commands)
 		if self._numberProcessing: text = self._formatNumbers(text)
-		text = f"~r{self._rate}]~e{self._excitation}]~v{self.headsize}]~f{self._pitch}]~g{self._volume}]~u{self._unvoicedVolume}]~h{self._inflection}]{text} ~|"
-		_execWhenDone(self._speakBg, text, idx, mustBeAsync=True)
+		return f"~r{self._rate}]~e{self._excitation}]~v{self.headsize}]~f{self._pitch}]~g{self._volume}]~u{self._unvoicedVolume}]~h{self._inflection}]{text} ~|"
 
-	def _speakBg(self, text, idx):
+	def _speakBg(self, segments, leadingIndexes):
 		if self._use_helper:
-			self._speakBg_helper(text, idx)
+			self._speakBg_helper(segments, leadingIndexes)
 		else:
-			self._speakBg_dll(text, idx)
+			self._speakBg_dll(segments, leadingIndexes)
 
-	def _speakBg_dll(self, text, idx):
+	def _queueIndexes(self, indexes):
+		if indexes:
+			self.player.feed(b"", 0, onDone=lambda indexes=tuple(indexes): self._notifyIndexes(indexes))
+
+	def _notifyIndexes(self, indexes):
+		for index in indexes:
+			synthIndexReached.notify(synth=self, index=index)
+
+	def _speechFailed(self, message):
+		log.error(message)
+		self.speaking = False
+		synthDoneSpeaking.notify(synth=self)
+
+	def _speakBg_dll(self, segments, leadingIndexes):
 		@bst_async_callback
 		def on_audio(data, size, user):
 			if not self.speaking: return False
 			self.player.feed(data, size)
 			return True
 		self.speaking = True
-		# As a dirty hack to make indent nav beeps mostly work, indicate that we've reached the first index immedietly.
-		if idx and len(idx) > 1:
-			synthIndexReached.notify(synth=self, index=idx.pop(0))
-		txt = text.translate(self.table).encode('windows-1252', 'replace')
-		self.dll.bst_speak_async(self.handle, on_audio, None, txt, -1, 0, c_float(4 if self.rateBoost else 1), 0)
-		if not self.speaking: return
-		f = lambda idx=idx: self.done(idx)
-		self.player.feed(b"", 0, onDone=f)
+		self._notifyIndexes(leadingIndexes)
+		for text, indexes in segments:
+			txt = text.translate(self.table).encode('windows-1252', 'replace')
+			self.dll.bst_speak_async(self.handle, on_audio, None, txt, -1, 0, c_float(4 if self.rateBoost else 1), 0)
+			if not self.speaking: return
+			self._queueIndexes(indexes)
+		self.player.feed(b"", 0, onDone=self.done)
 		self.player.idle()
 
-	def _speakBg_helper(self, text, idx):
+	def _speakBg_helper(self, segments, leadingIndexes):
 		# Restart helper if it died unexpectedly.
 		if self._helper is None or self._helper.poll() is not None:
-			self._start_helper()
+			try:
+				self._start_helper()
+			except (OSError, RuntimeError):
+				log.error("Unable to start the BeSTspeech helper", exc_info=True)
+				self.speaking = True
+				self._speechFailed("The BeSTspeech helper could not be started")
+				return
 		self.speaking = True
-		# As a dirty hack to make indent nav beeps mostly work, indicate that we've reached the first index immedietly.
-		if idx and len(idx) > 1:
-			synthIndexReached.notify(synth=self, index=idx.pop(0))
+		self._notifyIndexes(leadingIndexes)
+		for text, indexes in segments:
+			if not self._speakHelperSegment(text):
+				if self.speaking:
+					self._speechFailed("The BeSTspeech helper stopped responding")
+				return
+			if not self.speaking: return
+			self._queueIndexes(indexes)
+		self.player.feed(b"", 0, onDone=self.done)
+		self.player.idle()
+
+	def _speakHelperSegment(self, text):
 		txt = text.translate(self.table).encode('windows-1252', 'replace')
 		rate_mult = 4.0 if self._rateBoost else 1.0
-		# Send SPEAK command: [uint32 text_len][float32 rate_mult][text bytes]
 		try:
-			# cancel() runs on NVDA's main thread. Serialize complete protocol
-			# messages so a CANCEL header cannot split a SPEAK payload.
 			with self._helperWriteLock:
 				self._helper.stdin.write(struct.pack('<If', len(txt), rate_mult))
 				self._helper.stdin.write(txt)
 				self._helper.stdin.flush()
 		except (BrokenPipeError, OSError):
 			log.error("Unable to send speech to the BeSTspeech helper", exc_info=True)
-			return
-		# Read audio chunks until end-of-utterance sentinel (chunk_len == 0).
-		readFailed = False
+			return False
 		while True:
 			hdr = self._helper_read_exact(4)
-			if hdr is None:
-				readFailed = True
-				break
+			if hdr is None: return False
 			chunk_len = struct.unpack('<I', hdr)[0]
-			if chunk_len == 0:
-				break
+			if chunk_len == 0: return True
 			chunk = self._helper_read_exact(chunk_len)
-			if chunk is None:
-				readFailed = True
-				break
+			if chunk is None: return False
 			if self.speaking:
 				self.player.feed(chunk, len(chunk))
-		if not self.speaking:
-			return
-		if readFailed:
-			log.error(
-				"The BeSTspeech helper stopped responding (exit code %s)",
-				self._helper.poll(),
-			)
-			self.speaking = False
-			return
-		f = lambda idx=idx: self.done(idx)
-		self.player.feed(b"", 0, onDone=f)
-		self.player.idle()
 
 	def _helper_read_exact(self, n):
 		buf = b""
@@ -374,9 +392,8 @@ class SynthDriver(SynthDriver):
 			buf += chunk
 		return buf
 
-	def done(self, idx):
-		for i in idx:
-			synthIndexReached.notify(synth=self, index=i)
+	def done(self):
+		self.speaking = False
 		synthDoneSpeaking.notify(synth=self)
 
 	def terminate(self):
