@@ -319,6 +319,8 @@ class SynthDriver(SynthDriver):
 	def _speechFailed(self, message):
 		log.error(message)
 		self.speaking = False
+		if self.player:
+			self.player.stop()
 		synthDoneSpeaking.notify(synth=self)
 
 	def _speakBg_dll(self, segments, leadingIndexes):
