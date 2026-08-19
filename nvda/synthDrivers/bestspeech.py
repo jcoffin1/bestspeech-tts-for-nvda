@@ -94,7 +94,14 @@ class SynthDriver(SynthDriver):
 
 	@classmethod
 	def check(cls):
-		return True
+		driverDir = os.path.dirname(__file__)
+		return (
+			os.path.isfile(os.path.join(driverDir, "b32_tts.dll"))
+			and (
+				os.path.isfile(os.path.join(driverDir, "b32_wrapper.dll"))
+				or os.path.isfile(os.path.join(driverDir, "b32_helper.exe"))
+			)
+		)
 
 	def __init__(self):
 		super().__init__()
@@ -107,6 +114,7 @@ class SynthDriver(SynthDriver):
 		except:
 			currentSoundcardOutput = config.conf["audio"]["outputDevice"]
 		self.player = nvwave.WavePlayer(1, 11025, 16, outputDevice=currentSoundcardOutput)
+		self._helperWriteLock = threading.Lock()
 		self._helper = None
 		try:
 			self.dll = ctypes.cdll[wrapper_path]
@@ -138,6 +146,8 @@ class SynthDriver(SynthDriver):
 
 	def _start_helper(self):
 		helper_path = os.path.join(os.path.dirname(__file__), 'b32_helper.exe')
+		if not os.path.isfile(helper_path):
+			raise RuntimeError("The 32-bit BeSTspeech helper is missing")
 		self._helper = subprocess.Popen(
 			[helper_path, self._dll_path],
 			stdin=subprocess.PIPE,
@@ -270,9 +280,10 @@ class SynthDriver(SynthDriver):
 				lst.append("~n1,1]" if char_mode_on else "~n1,0]")
 			elif isinstance(item,PitchCommand):
 				try: multiplier = item.multiplier
-				except ZeroDevisionError: multiplier = 1
+				except (AttributeError, ZeroDivisionError): multiplier = 1
 				f = int(self._pitch * multiplier)
 				lst.append(f"~f{f}]")
+				pitch_modified = True
 		text = " ".join(lst)
 		if self._numberProcessing: text = self._formatNumbers(text)
 		text = f"~r{self._rate}]~e{self._excitation}]~v{self.headsize}]~f{self._pitch}]~g{self._volume}]~u{self._unvoicedVolume}]~h{self._inflection}]{text} ~|"
@@ -313,25 +324,39 @@ class SynthDriver(SynthDriver):
 		rate_mult = 4.0 if self._rateBoost else 1.0
 		# Send SPEAK command: [uint32 text_len][float32 rate_mult][text bytes]
 		try:
-			self._helper.stdin.write(struct.pack('<If', len(txt), rate_mult))
-			self._helper.stdin.write(txt)
-			self._helper.stdin.flush()
-		except OSError:
+			# cancel() runs on NVDA's main thread. Serialize complete protocol
+			# messages so a CANCEL header cannot split a SPEAK payload.
+			with self._helperWriteLock:
+				self._helper.stdin.write(struct.pack('<If', len(txt), rate_mult))
+				self._helper.stdin.write(txt)
+				self._helper.stdin.flush()
+		except (BrokenPipeError, OSError):
+			log.error("Unable to send speech to the BeSTspeech helper", exc_info=True)
 			return
 		# Read audio chunks until end-of-utterance sentinel (chunk_len == 0).
+		readFailed = False
 		while True:
 			hdr = self._helper_read_exact(4)
 			if hdr is None:
+				readFailed = True
 				break
 			chunk_len = struct.unpack('<I', hdr)[0]
 			if chunk_len == 0:
 				break
 			chunk = self._helper_read_exact(chunk_len)
 			if chunk is None:
+				readFailed = True
 				break
 			if self.speaking:
 				self.player.feed(chunk, len(chunk))
 		if not self.speaking:
+			return
+		if readFailed:
+			log.error(
+				"The BeSTspeech helper stopped responding (exit code %s)",
+				self._helper.poll(),
+			)
+			self.speaking = False
 			return
 		f = lambda idx=idx: self.done(idx)
 		self.player.feed(b"", 0, onDone=f)
@@ -362,13 +387,16 @@ class SynthDriver(SynthDriver):
 			if self._helper is not None:
 				# Send QUIT command then wait for clean exit.
 				try:
-					self._helper.stdin.write(struct.pack('<I', 0xFFFFFFFF))
-					self._helper.stdin.flush()
+					with self._helperWriteLock:
+						self._helper.stdin.write(struct.pack('<I', 0xFFFFFFFF))
+						self._helper.stdin.flush()
 				except OSError:
 					pass
-				self._helper.wait(timeout=2)
-				if self._helper.poll() is None:
+				try:
+					self._helper.wait(timeout=2)
+				except subprocess.TimeoutExpired:
 					self._helper.kill()
+					self._helper.wait(timeout=2)
 		else:
 			self.dll.bst_free(self.handle)
 
@@ -379,13 +407,16 @@ class SynthDriver(SynthDriver):
 				item = bgQueue.get_nowait()
 			except queue.Empty:
 				break
+			else:
+				bgQueue.task_done()
 		if self.player:
 			self.player.stop()
 		if self._use_helper and self._helper is not None:
 			# Send CANCEL command: text_len == 0
 			try:
-				self._helper.stdin.write(struct.pack('<I', 0))
-				self._helper.stdin.flush()
+				with self._helperWriteLock:
+					self._helper.stdin.write(struct.pack('<I', 0))
+					self._helper.stdin.flush()
 			except OSError:
 				pass
 

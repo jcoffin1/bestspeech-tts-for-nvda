@@ -17,6 +17,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <atomic>
 #include <fcntl.h>
 #include <io.h>
 #include <stdint.h>
@@ -25,9 +26,9 @@
 #include "b32_wrapper.h"
 
 // Set to true by the stdin thread to abort the current synthesis callback.
-static volatile bool g_cancel = false;
+static std::atomic_bool g_cancel(false);
 // Set to true when the helper should exit cleanly.
-static volatile bool g_quit = false;
+static std::atomic_bool g_quit(false);
 
 // ---- Pending-command queue (capacity 1) ----------------------------------- //
 // The stdin reader thread deposits a single pending speak command here.
@@ -133,16 +134,16 @@ static DWORD WINAPI stdin_reader(LPVOID /*unused*/)
 
 // ---------------------------------------------------------------------------
 
-int main(int argc, const char** argv)
+int wmain(int argc, wchar_t** argv)
 {
     // Switch stdin/stdout to binary mode to avoid newline translation.
     _setmode(_fileno(stdin),  _O_BINARY);
     _setmode(_fileno(stdout), _O_BINARY);
 
-    const char* dll_path = "b32_tts.dll";
+    const wchar_t* dll_path = L"b32_tts.dll";
     if (argc >= 2) dll_path = argv[1];
 
-    bst_state* state = bst_init(dll_path);
+    bst_state* state = bst_init_w(dll_path);
     if (!state) return 1;
 
     InitializeCriticalSection(&g_pending_cs);

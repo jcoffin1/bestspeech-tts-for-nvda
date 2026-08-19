@@ -142,8 +142,13 @@ MMRESULT WINAPI waveOutWriteHook(HWAVEOUT ptr, WAVEHDR* header, UINT size) {
 	if (winmm_hooked_state->async_stop_speaking) return MMSYSERR_NOERROR; // Callback returned false, drop all remaining buffers.
 	short* data = (short*)header->lpData;
 	DWORD data_len = header->dwBufferLength;
-	if (winmm_hooked_state->sonic_stream && sonicGetSpeed(winmm_hooked_state->sonic_stream) != 1.0f && sonicWriteShortToStream(winmm_hooked_state->sonic_stream, data, data_len / sizeof(short)))
-		data_len = sonicReadShortFromStream(winmm_hooked_state->sonic_stream, data, data_len) * sizeof(short);
+	if (winmm_hooked_state->sonic_stream && sonicGetSpeed(winmm_hooked_state->sonic_stream) != 1.0f && sonicWriteShortToStream(winmm_hooked_state->sonic_stream, data, data_len / sizeof(short))) {
+		// sonicReadShortFromStream takes a sample count, not a byte count. Passing
+		// data_len here allowed Sonic to write up to twice the capacity of the
+		// BeSTspeech-owned 16-bit buffer, intermittently crashing the helper.
+		const DWORD sample_capacity = data_len / sizeof(short);
+		data_len = sonicReadShortFromStream(winmm_hooked_state->sonic_stream, data, sample_capacity) * sizeof(short);
+	}
 	waveOutput(data, data_len);
 	return MMSYSERR_NOERROR;
 }
