@@ -149,7 +149,11 @@ MMRESULT WINAPI waveOutWriteHook(HWAVEOUT ptr, WAVEHDR* header, UINT size) {
 		const DWORD sample_capacity = data_len / sizeof(short);
 		data_len = sonicReadShortFromStream(winmm_hooked_state->sonic_stream, data, sample_capacity) * sizeof(short);
 	}
-	waveOutput(data, data_len);
+	// Sonic can buffer input without producing output for this callback. A
+	// zero-length block is also the helper protocol's end-of-utterance sentinel,
+	// so forwarding it truncates boosted speech and desynchronizes the next
+	// request. The remaining samples are delivered by a later write or flush.
+	if (data_len) waveOutput(data, data_len);
 	return MMSYSERR_NOERROR;
 }
 MMRESULT WINAPI waveOutUnprepareHeaderHook(HWAVEOUT ptr, WAVEHDR* header, UINT size) {
