@@ -10,6 +10,7 @@
 //   EOF on stdin is treated the same as QUIT.
 //
 // === stdout protocol (binary, little-endian) ===
+//   Startup ready    : [uint32 = 0x52545342 ("BSTR")]
 //   Audio chunk    : [uint32 chunk_len (> 0)] [chunk_len bytes raw 16-bit mono PCM @ 11025 Hz]
 //   End-of-utter.  : [uint32 = 0]
 //   One end-of-utterance sentinel is emitted after every SPEAK command
@@ -20,6 +21,8 @@
 #include <atomic>
 #include <fcntl.h>
 #include <io.h>
+#include <math.h>
+#include <new>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -46,12 +49,14 @@ static CRITICAL_SECTION  g_pending_cs;
 // Signalled when g_pending.valid becomes true, or g_quit becomes true.
 static HANDLE            g_cmd_event;
 static const uint32_t     MAX_TEXT_LENGTH = 16 * 1024 * 1024;
+static const uint32_t     HELPER_READY = 0x52545342u;
 
 // ---------------------------------------------------------------------------
 
 static bool audio_cb(char* data, long size, void* /*user*/)
 {
     if (g_cancel) return false;
+    if (!data || size <= 0) return true;
 
     uint32_t len = (uint32_t)size;
     if (fwrite(&len, sizeof(uint32_t), 1, stdout) != 1) return false;
@@ -115,7 +120,20 @@ static DWORD WINAPI stdin_reader(LPVOID /*unused*/)
             return 0;
         }
 
-        char* text = new char[text_len + 1];
+        if (!isfinite(rate_mult) || rate_mult < 0.1f || rate_mult > 10.0f) {
+            g_quit = true;
+            g_cancel = true;
+            SetEvent(g_cmd_event);
+            return 0;
+        }
+
+        char* text = new (std::nothrow) char[text_len + 1];
+        if (!text) {
+            g_quit = true;
+            g_cancel = true;
+            SetEvent(g_cmd_event);
+            return 0;
+        }
         if (!read_exact(stdin, text, text_len)) {
             delete[] text;
             g_quit = true;
@@ -169,6 +187,14 @@ int wmain(int argc, wchar_t** argv)
         return 3;
     }
 
+    // Do not let NVDA accept a process that started but failed to initialize
+    // the engine or its command reader.
+    if (fwrite(&HELPER_READY, sizeof(HELPER_READY), 1, stdout) != 1 || fflush(stdout) != 0) {
+        // Returning from the process also terminates the blocked stdin reader;
+        // waiting for it here could itself hang when the parent pipe is open.
+        return 4;
+    }
+
     while (true) {
         WaitForSingleObject(g_cmd_event, INFINITE);
         if (g_quit) break;
@@ -185,15 +211,27 @@ int wmain(int argc, wchar_t** argv)
         if (!cmd.valid) continue;
 
         g_cancel = false;
+        // A QUIT may have arrived after this command was dequeued. Checking
+        // after clearing an earlier CANCEL avoids overwriting the quit signal.
+        if (g_quit) {
+            g_cancel = true;
+            delete[] cmd.text;
+            break;
+        }
         bst_speak_async(state, audio_cb, nullptr, cmd.text, -1, 0, cmd.rate_mult, 0);
         delete[] cmd.text;
 
         // Always emit end-of-utterance sentinel, even if cancelled.
         uint32_t zero = 0;
-        fwrite(&zero, sizeof(uint32_t), 1, stdout);
-        fflush(stdout);
+        if (fwrite(&zero, sizeof(uint32_t), 1, stdout) != 1 || fflush(stdout) != 0) {
+            g_quit = true;
+            break;
+        }
     }
 
+    // If stdout failed, the reader may still be blocked on an open stdin pipe.
+    // Cancel that synchronous read so process shutdown cannot hang forever.
+    CancelSynchronousIo(reader_thread);
     WaitForSingleObject(reader_thread, INFINITE);
     CloseHandle(reader_thread);
     EnterCriticalSection(&g_pending_cs);

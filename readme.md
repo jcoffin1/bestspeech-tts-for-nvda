@@ -27,7 +27,7 @@ You can set the voice to a single questionmark (?) to list available voices. For
 
 ## NVDA addon
 
-This repository comes bundled with an NVDA addon that uses this wrapper. It supports both 32-bit NVDA and 64-bit NVDA 2026.1 or later. Under 64-bit NVDA, the driver runs the legacy 32-bit engine through `b32_helper.exe`; under 32-bit NVDA, it loads the wrapper directly.
+This repository comes bundled with an NVDA addon that uses this wrapper. It supports 64-bit NVDA 2026.2 and later. The driver runs the legacy 32-bit engine through `b32_helper.exe`.
 
 You can find a prebuilt version of the addon on this repository's releases page. To make it from source, run SCons, then copy `bin/b32_tts.dll`, `bin/b32_wrapper.dll`, and `bin/b32_helper.exe` to `nvda/synthDrivers` before packaging the contents of `nvda` as a `.nvda-addon` file. This addon gives control of many parameters from basic things like pitch and rate to fun things like head size, excitation and unvoiced volume. It also comes bundled with Rommix's voices like the wrapper itself does, though the custom voices are done in the addon instead of using the wrapper's functionality for the purposes of updating the NVDA parameter sliders in real time as a new voice is selected.
 

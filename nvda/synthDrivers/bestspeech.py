@@ -4,14 +4,12 @@ import subprocess
 from synthDriverHandler import SynthDriver, synthIndexReached, synthDoneSpeaking, VoiceInfo
 from speech.commands import IndexCommand, PitchCommand, CharacterModeCommand
 import ctypes
-from ctypes import c_char_p, c_void_p, c_long, c_float, c_wchar_p, byref, POINTER, CFUNCTYPE
+from ctypes import c_char_p, c_void_p, c_long, c_float, CFUNCTYPE
 import nvwave
 import config
-import winUser
 from autoSettingsUtils.driverSetting import DriverSetting, BooleanDriverSetting, NumericDriverSetting
 from autoSettingsUtils.utils import StringParameterInfo
 import re
-import time
 import queue
 import threading
 from logHandler import log
@@ -24,6 +22,8 @@ minInflection = -150
 maxInflection = 150
 minVolume = -68
 maxVolume = 12
+HELPER_READY = b"BSTR"
+MAX_HELPER_AUDIO_CHUNK = 4 * 1024 * 1024
 
 # Thanks Rommix for the custom voices.
 voices = {
@@ -119,10 +119,16 @@ class SynthDriver(SynthDriver):
 			self.dll.bst_init_w.argtypes = (ctypes.c_wchar_p,)
 			self.dll.bst_init_w.restype = c_void_p
 			self.dll.bst_free.argtypes = (c_void_p,)
-			self.dll.bst_speak_async.restype = c_void_p
+			self.dll.bst_speak_async.argtypes = (
+				c_void_p, bst_async_callback, c_void_p, c_char_p,
+				c_long, c_long, c_float, c_long,
+			)
+			self.dll.bst_speak_async.restype = None
 			self.handle = self.dll.bst_init_w(path)
+			if not self.handle:
+				raise RuntimeError("The BeSTspeech engine failed to initialize")
 			self._use_helper = False
-		except (OSError, AttributeError):
+		except (OSError, AttributeError, RuntimeError):
 			# b32_wrapper.dll could not be loaded in-process (e.g. 32-bit DLL in
 			# 64-bit NVDA 2026+, or DLL simply absent). Fall back to the
 			# out-of-process 32-bit helper.
@@ -134,6 +140,7 @@ class SynthDriver(SynthDriver):
 		self.bgThread = BgThread()
 		self.bgThread.start()
 		self.rate = 90
+		self.rateBoost = False
 		self.volume = self._paramToPercent(0, minVolume, maxVolume)
 		self.voice = "fred" # This will automatically set all other parameters like pitch, inflection, excitation and more.
 		self.numberProcessing = False
@@ -146,13 +153,32 @@ class SynthDriver(SynthDriver):
 		helper_path = os.path.join(os.path.dirname(__file__), 'b32_helper.exe')
 		if not os.path.isfile(helper_path):
 			raise RuntimeError("The 32-bit BeSTspeech helper is missing")
-		self._helper = subprocess.Popen(
+		helper = subprocess.Popen(
 			[helper_path, self._dll_path],
 			stdin=subprocess.PIPE,
 			stdout=subprocess.PIPE,
 			stderr=subprocess.DEVNULL,
 			creationflags=subprocess.CREATE_NO_WINDOW
 		)
+		startupResult = queue.Queue(maxsize=1)
+		def readStartupResult():
+			try:
+				startupResult.put(helper.stdout.read(len(HELPER_READY)))
+			except OSError:
+				startupResult.put(b"")
+		threading.Thread(target=readStartupResult, name="BeSTspeechHelperStartup", daemon=True).start()
+		try:
+			ready = startupResult.get(timeout=3)
+		except queue.Empty:
+			ready = b""
+		if ready != HELPER_READY:
+			try:
+				helper.kill()
+				helper.wait(timeout=2)
+			except (OSError, subprocess.TimeoutExpired):
+				pass
+			raise RuntimeError("The BeSTspeech helper failed to initialize")
+		self._helper = helper
 
 	def loadSettings(self, onlyChanged = False):
 		# We can probably remove this in a bit, we override this to make sure people's excitation setting doesn't break across addon versions.
@@ -196,8 +222,11 @@ class SynthDriver(SynthDriver):
 		return self._paramToPercent(self._inflection, minInflection, maxInflection)
 
 	def _set_headsize(self, vl):
-		n = int(vl)
-		self._headsize = vl if 1 <= n <= 6 else "1"
+		try:
+			n = int(vl)
+		except (TypeError, ValueError):
+			n = 0
+		self._headsize = str(n) if 1 <= n <= 6 else "1"
 
 	def _get_headsize(self):
 		return self._headsize
@@ -206,8 +235,11 @@ class SynthDriver(SynthDriver):
 		return { str(i): StringParameterInfo(str(i), str(i)) for i in range(1, 7)}
 
 	def _set_excitation(self, vl):
-		n = int(vl)
-		self._excitation = vl if 1 <= n <= 7 else "3"
+		try:
+			n = int(vl)
+		except (TypeError, ValueError):
+			n = 0
+		self._excitation = str(n) if 1 <= n <= 7 else "3"
 
 	def _get_excitation(self):
 		return self._excitation
@@ -238,13 +270,17 @@ class SynthDriver(SynthDriver):
 		self._voice = vl
 		# set voice parameters
 		for p in voices[vl]:
-			if not hasattr(self, p): continue
 			try:
 				minimum = globals()[f"min{p.title()}"] if not "Volume" in p else globals()["minVolume"]
 				maximum = globals()[f"max{p.title()}"] if not "Volume" in p else globals()["maxVolume"]
-				setattr(self, p, self._paramToPercent(voices[vl][p], minimum, maximum))
+				value = self._paramToPercent(voices[vl][p], minimum, maximum)
 			except KeyError:
-				setattr(self, p, voices[vl][p])
+				value = voices[vl][p]
+			setter = getattr(self, f"_set_{p}", None)
+			if setter:
+				setter(value)
+			else:
+				setattr(self, p, value)
 
 	def _get_voice(self):
 		return self._voice
@@ -260,25 +296,33 @@ class SynthDriver(SynthDriver):
 
 	def speak(self, speechSequence):
 		initialCommands = ["~n10,0]" if self._abbreviations else "~n10,1]", "~~1,0]" if self._phrasePrediction else "~~1,1]"]
-		lst = list(initialCommands)
+		char_mode_on = False
+		pitch_multiplier = 1
+		def pitchForMultiplier(multiplier):
+			return max(minPitch, min(maxPitch, int(self._pitch * multiplier)))
+
+		def newSegmentCommands():
+			commands = list(initialCommands)
+			# BeSTspeech retains character mode between synthesis calls. Always
+			# state the mode explicitly so a spelling request cannot leak into a
+			# later ordinary utterance.
+			commands.append("~n1,1]" if char_mode_on else "~n1,0]")
+			if pitch_multiplier != 1:
+				commands.append(f"~f{pitchForMultiplier(pitch_multiplier)}]")
+			return commands
+
+		lst = newSegmentCommands()
 		segments = []
 		leadingIndexes = []
 		hasText = False
-		char_mode_on = pitch_modified = False
 		for item in speechSequence:
 			if isinstance(item, str):
 				lst.append(item)
 				hasText = True
-				if char_mode_on:
-					lst.append("~n1,0]")
-					char_mode_on = False
-				if pitch_modified:
-					lst.append(f"~f{self._pitch}]")
-					pitch_modified = False
 			elif isinstance(item, IndexCommand):
 				if hasText:
 					segments.append([self._formatSpeechSegment(lst), [item.index]])
-					lst = list(initialCommands)
+					lst = newSegmentCommands()
 					hasText = False
 				elif segments:
 					segments[-1][1].append(item.index)
@@ -290,9 +334,9 @@ class SynthDriver(SynthDriver):
 			elif isinstance(item,PitchCommand):
 				try: multiplier = item.multiplier
 				except (AttributeError, ZeroDivisionError): multiplier = 1
-				f = int(self._pitch * multiplier)
+				pitch_multiplier = multiplier
+				f = pitchForMultiplier(multiplier)
 				lst.append(f"~f{f}]")
-				pitch_modified = True
 		if hasText:
 			segments.append([self._formatSpeechSegment(lst), []])
 		_execWhenDone(self._speakBg, segments, leadingIndexes, mustBeAsync=True)
@@ -362,32 +406,39 @@ class SynthDriver(SynthDriver):
 		self.player.idle()
 
 	def _speakHelperSegment(self, text):
+		helper = self._helper
+		if helper is None:
+			return False
 		txt = text.translate(self.table).encode('windows-1252', 'replace')
 		rate_mult = 4.0 if self._rateBoost else 1.0
 		try:
 			with self._helperWriteLock:
-				self._helper.stdin.write(struct.pack('<If', len(txt), rate_mult))
-				self._helper.stdin.write(txt)
-				self._helper.stdin.flush()
-		except (BrokenPipeError, OSError):
+				helper.stdin.write(struct.pack('<If', len(txt), rate_mult))
+				helper.stdin.write(txt)
+				helper.stdin.flush()
+		except (AttributeError, BrokenPipeError, OSError, ValueError):
 			log.error("Unable to send speech to the BeSTspeech helper", exc_info=True)
 			return False
 		while True:
-			hdr = self._helper_read_exact(4)
+			hdr = self._helper_read_exact(helper, 4)
 			if hdr is None: return False
 			chunk_len = struct.unpack('<I', hdr)[0]
 			if chunk_len == 0: return True
-			chunk = self._helper_read_exact(chunk_len)
+			if chunk_len > MAX_HELPER_AUDIO_CHUNK:
+				log.error("Invalid audio chunk length from the BeSTspeech helper: %d", chunk_len)
+				self._stop_helper()
+				return False
+			chunk = self._helper_read_exact(helper, chunk_len)
 			if chunk is None: return False
 			if self.speaking:
 				self.player.feed(chunk, len(chunk))
 
-	def _helper_read_exact(self, n):
+	def _helper_read_exact(self, helper, n):
 		buf = b""
 		while len(buf) < n:
 			try:
-				chunk = self._helper.stdout.read(n - len(buf))
-			except OSError:
+				chunk = helper.stdout.read(n - len(buf))
+			except (AttributeError, OSError, ValueError):
 				return None
 			if not chunk:
 				return None
@@ -400,24 +451,46 @@ class SynthDriver(SynthDriver):
 
 	def terminate(self):
 		self.cancel()
-		bgQueue.put((None, None, None))
-		self.bgThread.join()
+		# Stop the helper first. The background thread may be blocked reading its
+		# stdout, and cannot consume the queue sentinel until that pipe closes.
 		if self._use_helper:
-			if self._helper is not None:
-				# Send QUIT command then wait for clean exit.
-				try:
-					with self._helperWriteLock:
-						self._helper.stdin.write(struct.pack('<I', 0xFFFFFFFF))
-						self._helper.stdin.flush()
-				except OSError:
-					pass
-				try:
-					self._helper.wait(timeout=2)
-				except subprocess.TimeoutExpired:
-					self._helper.kill()
-					self._helper.wait(timeout=2)
+			self._stop_helper()
 		else:
+			# The wrapper's hidden WinMM window must be destroyed by the same
+			# thread that created it during synthesis.
+			bgQueue.put((self._free_direct, (), {}))
+		bgQueue.put((None, None, None))
+		self.bgThread.join(timeout=3)
+		if self.bgThread.is_alive():
+			log.error("BeSTspeech background thread did not stop during termination")
+
+	def _free_direct(self):
+		if self.handle:
 			self.dll.bst_free(self.handle)
+			self.handle = None
+
+	def _stop_helper(self):
+		helper = self._helper
+		self._helper = None
+		if helper is None:
+			return
+		try:
+			with self._helperWriteLock:
+				helper.stdin.write(struct.pack('<I', 0xFFFFFFFF))
+				helper.stdin.flush()
+		except (BrokenPipeError, OSError, ValueError):
+			pass
+		try:
+			helper.wait(timeout=2)
+		except subprocess.TimeoutExpired:
+			try:
+				helper.kill()
+			except OSError:
+				pass
+			try:
+				helper.wait(timeout=2)
+			except subprocess.TimeoutExpired:
+				log.error("Unable to stop the BeSTspeech helper process")
 
 	def cancel(self):
 		self.speaking = False
@@ -436,7 +509,7 @@ class SynthDriver(SynthDriver):
 				with self._helperWriteLock:
 					self._helper.stdin.write(struct.pack('<I', 0))
 					self._helper.stdin.flush()
-			except OSError:
+			except (BrokenPipeError, OSError, ValueError):
 				pass
 
 	def pause(self, switch):
