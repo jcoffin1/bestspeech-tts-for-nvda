@@ -116,6 +116,14 @@ b32w_export BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
 
 // Actual waveout hooks, most of these are no-ops/passthroughs accept for open and write. The no-ops must still exist to insure that no unwanted function calls from bestspeech reach the WinMM API.
 MMRESULT WINAPI waveOutOpenHook(LPHWAVEOUT outptr, UINT device, LPCWAVEFORMATEX format, DWORD_PTR callback, DWORD_PTR instance, DWORD flags) {
+	// BeSTspeech queries format support with a null callback before opening
+	// its output. That query must use our in-memory sink as well: forwarding
+	// it to WinMM makes synthesis fail on machines without an audio device.
+	if (winmm_hooked_state && (flags & WAVE_FORMAT_QUERY) && format &&
+		format->wFormatTag == WAVE_FORMAT_PCM && format->nChannels == 1 &&
+		format->nSamplesPerSec == 11025 && format->wBitsPerSample == 16) {
+		return MMSYSERR_NOERROR;
+	}
 	if (!winmm_hooked_state || (bst_state*)callback != winmm_hooked_state) return waveOutOpenProc(outptr, device, format, callback, instance, flags);
 	*outptr = (HWAVEOUT)callback; // Now all other hooks will receive state information in their first parameter, though we prefer to use winmm_hooked_state. This also makes sure our hook returns a semblance of what the calling function is expecting.
 	if (!winmm_hooked_state->audio && !winmm_hooked_state->async_callback) {
