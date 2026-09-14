@@ -1,4 +1,7 @@
-# b32_wrapper
+# BeSTSpeech TTS for NVDA
+
+The NVDA add-on and its in-memory speech wrapper are maintained in this repository.
+See [release notes](RELEASE-NOTES.md) and [downloads](https://github.com/jcoffin1/bestspeech-tts-for-nvda/releases/latest).
 
 ## What is this?
 In late 2024, someone who goes by rommix0 introduced the blind community to a windows x86 version of the ancient yet saught after Keynote Gold speech synthesis engine.
@@ -10,7 +13,7 @@ This project negates the aformentioned issue by actually hooking the waveOut fun
 Bestspeech outputs audio in 16 bit 11025hz mono pcm.
 
 ## How to build?
-This project uses the SCons build system. If you have scons and a c++ compiler installed and on your path, you can just run scons -s in the root of this project to generate a .dll wrapper, a test program and a statically linked high level command line utility. Prebuilt binaries are provided on the releases page, or you can fork the repository and run the build action.
+This project uses the SCons build system. Install SCons and an x86-capable Visual C++ compiler, then run `scons -s` in the repository root. Run `python tests/test_driver.py` and `python tests/test_helper.py` to validate the driver and native audio. Build both distribution archives with `python tests/build_packages.py`, then validate the add-on with `python tests/validate_package.py b32_assets/bestspeech.nvda-addon`. Prebuilt binaries are provided on the releases page.
 
 ## How to use?
 

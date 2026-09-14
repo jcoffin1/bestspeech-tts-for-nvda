@@ -15,8 +15,8 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
-    - uses: actions/checkout@v4
-    - uses: actions/setup-python@v5
+    - uses: actions/checkout@v7
+    - uses: actions/setup-python@v7
       with:
         python-version: "3.13"
     - name: build
@@ -28,22 +28,13 @@ jobs:
         scons -s
         python tests/test_driver.py
         python tests/test_helper.py
-        cp bin/*.dll nvda/synthDrivers
-        cp bin/b32_helper.exe nvda/synthDrivers
-        Copy-Item -LiteralPath LICENSE, deps.txt -Destination nvda
-        mkdir b32_assets
-        cd bin
-        7z a -tzip ../b32_assets/b32_bin.zip *.dll b32_spk.exe b32_helper.exe
-        cd ..
-        7z a -tzip b32_assets/b32_bin.zip LICENSE deps.txt
-        cd nvda
-        7z a -tzip ../b32_assets/bestspeech.nvda-addon *
-        cd ..
+        python tests/build_packages.py
         python tests/validate_package.py b32_assets/bestspeech.nvda-addon
-    - uses: actions/upload-artifact@v4
+    - uses: actions/upload-artifact@v7
       with:
         name: b32_assets
         path: 'b32_assets'
+        if-no-files-found: error
   publish_release:
     needs: ["windows_build"]
     if: github.ref_type == 'tag'
@@ -51,13 +42,15 @@ jobs:
     permissions:
       contents: write
     steps:
-    - uses: actions/checkout@v4
-    - uses: actions/download-artifact@v4
-    - uses: ghalactic/github-release-from-tag@v5
+    - uses: actions/checkout@v7
+    - uses: actions/download-artifact@v8
       with:
-        checksumGenerateAssets: "true"
-        assets: |
-          - path: b32_assets/b32_bin.zip
-            name: b32_bin_${{github.ref_name}}.zip
-          - path: b32_assets/bestspeech.nvda-addon
-            name: bestspeech_${{github.ref_name}}.nvda-addon
+        name: b32_assets
+        path: b32_assets
+    - name: Publish validated release
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        gh release create "$GITHUB_REF_NAME" b32_assets/* \
+          --verify-tag --title "BeSTSpeech TTS for NVDA ${GITHUB_REF_NAME#v}" \
+          --notes-file RELEASE-NOTES.md

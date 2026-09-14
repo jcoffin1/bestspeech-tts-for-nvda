@@ -11,3 +11,7 @@ output
 *.wav
 !bin/b32_tts.dll
 !bin/MinHook.lib
+__pycache__/
+*.py[cod]
+.ruff_cache/
+b32_assets/
