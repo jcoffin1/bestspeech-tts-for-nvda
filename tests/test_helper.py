@@ -53,7 +53,7 @@ try:
 	for speed in (1.0, 4.0, 0.75):
 		send_speak(process, "BeSTspeech release regression. " * 8, speed)
 		audio = read_utterance(process)
-		assert audio and len(audio) % 2 == 0
+		assert audio and len(audio) % 2 == 0, f"Invalid audio at speed {speed}: {len(audio)} bytes"
 
 	lengths = []
 	for _ in range(10):

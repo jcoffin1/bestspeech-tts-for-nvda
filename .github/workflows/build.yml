@@ -5,22 +5,32 @@ on:
   push:
     branches:
       - main
+      - audit/bestspeech
     tags:
       - "*"
+permissions:
+  contents: read
 jobs:
   windows_build:
     runs-on: windows-latest
+    timeout-minutes: 15
     steps:
     - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.13"
     - name: build
+      shell: pwsh
       run: |
+        $ErrorActionPreference = 'Stop'
+        $PSNativeCommandUseErrorActionPreference = $true
         pip3 install scons
         scons -s
         python tests/test_driver.py
         python tests/test_helper.py
         cp bin/*.dll nvda/synthDrivers
         cp bin/b32_helper.exe nvda/synthDrivers
-        cp LICENSE deps.txt nvda
+        Copy-Item -LiteralPath LICENSE, deps.txt -Destination nvda
         mkdir b32_assets
         cd bin
         7z a -tzip ../b32_assets/b32_bin.zip *.dll b32_spk.exe b32_helper.exe
