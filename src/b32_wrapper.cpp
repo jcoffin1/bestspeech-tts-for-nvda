@@ -301,11 +301,13 @@ b32w_export void bst_free(bst_state* s) {
 }
 inline void bst_speak_internal(bst_state* s, const char* text, int voice, int rate, float rate_multiplier, int gain) {
 	if (!winmm_hook()) {
+		fprintf(stderr, "BeSTspeech: failed to install audio hooks\n");
 		s->async_stop_speaking = true;
 		return;
 	}
 	if (!s->message_window) s->message_window = create_message_window();
 	if (!s->message_window) {
+		fprintf(stderr, "BeSTspeech: failed to create message window (%lu)\n", GetLastError());
 		s->async_stop_speaking = true;
 		return;
 	}
@@ -334,7 +336,8 @@ inline void bst_speak_internal(bst_state* s, const char* text, int voice, int ra
 	s->bstSetParams(s->tts, BST_GAIN_SETTING, gain);
 	if (s->sonic_stream) sonicSetSpeed(s->sonic_stream, rate_multiplier);
 	winmm_hooked_state = s;
-	s->TtsWav(s->tts, s, text);
+	int result = s->TtsWav(s->tts, s, text);
+	if (result) fprintf(stderr, "BeSTspeech: synthesis returned %d\n", result);
 	winmm_hooked_state = nullptr;
 	if (voice >= 0 && voice < bst_voice_count) free((void*)text); // We've allocated a custom string in this case.
 }

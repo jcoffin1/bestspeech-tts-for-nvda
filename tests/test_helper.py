@@ -27,7 +27,7 @@ def start_helper():
 		[str(helper), str(engine)],
 		stdin=subprocess.PIPE,
 		stdout=subprocess.PIPE,
-		stderr=subprocess.PIPE,
+		stderr=None,
 	)
 	assert read_exact(process.stdout, len(ready)) == ready
 	return process
